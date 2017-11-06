@@ -1,4 +1,5 @@
 """Utilities for fast persistence of big data, with optional compression."""
+"""Utilities for fast persistence of big data, with optional compression."""
 
 # Author: Gael Varoquaux <gael dot varoquaux at normalesup dot org>
 # Copyright (c) 2009 Gael Varoquaux
@@ -69,6 +70,8 @@ class NumpyArrayWrapper(object):
         self.order = order
         self.dtype = dtype
         self.allow_mmap = allow_mmap
+        self.ego_id = id(self)
+        self.ref_id = None
 
     def write_array(self, array, pickler):
         """Write array bytes to pickler file handle.
@@ -209,7 +212,7 @@ class NumpyPickler(Pickler):
     ----------
     fp: file
         File object handle used for serializing the input object.
-    protocol: int, optional
+    protocol: int
         Pickle protocol used. Default is pickle.DEFAULT_PROTOCOL under
         python 3, pickle.HIGHEST_PROTOCOL otherwise.
     """
@@ -233,6 +236,8 @@ class NumpyPickler(Pickler):
         except ImportError:
             np = None
         self.np = np
+
+        self.array_memo = {}
 
     def _create_array_wrapper(self, array):
         """Create and returns a numpy array wrapper from a numpy array."""
@@ -264,6 +269,10 @@ class NumpyPickler(Pickler):
 
             # The array wrapper is pickled instead of the real array.
             wrapper = self._create_array_wrapper(obj)
+            if id(obj) in self.array_memo:
+                wrapper.ref_id = self.array_memo[id(obj)]
+            else:
+                self.array_memo[id(obj)] = wrapper.ego_id
             Pickler.save(self, wrapper)
 
             # A framer was introduced with pickle protocol 4 and we want to
@@ -275,11 +284,15 @@ class NumpyPickler(Pickler):
                 self.framer.commit_frame(force=True)
 
             # And then array bytes are written right after the wrapper.
-            wrapper.write_array(obj, self)
+            if wrapper.ref_id is None:
+                wrapper.write_array(obj, self)
             return
 
         return Pickler.save(self, obj)
 
+    def clear_memo(self):
+        super(NumpyPickler, self).clear_memo()
+        self.array_memo = {}
 
 class NumpyUnpickler(Unpickler):
     """A subclass of the Unpickler to unpickle our numpy pickles.
@@ -317,6 +330,8 @@ class NumpyUnpickler(Unpickler):
             np = None
         self.np = np
 
+        self.array_memo = {}
+
     def load_build(self):
         """Called to set the state of a newly created object.
 
@@ -338,7 +353,14 @@ class NumpyUnpickler(Unpickler):
             # the end of the unpickling.
             if isinstance(array_wrapper, NDArrayWrapper):
                 self.compat_mode = True
-            self.stack.append(array_wrapper.read(self))
+            if array_wrapper.ref_id is None:
+                self.stack.append(array_wrapper.read(self))
+                self.array_memo[array_wrapper.ego_id] = self.stack[-1]
+            else:
+                try:
+                    self.stack.append(self.array_memo[array_wrapper.ref_id])
+                except:
+                    raise Exception('ref_id not in array memo.')
 
     # Be careful to register our new method.
     if PY3_OR_LATER:
@@ -357,11 +379,10 @@ def dump(value, filename, compress=0, protocol=None, cache_size=None):
     -----------
     value: any Python object
         The object to store to disk.
-    filename: str, pathlib.Path, or file object.
-        The file object or path of the file in which it is to be stored.
-        The compression method corresponding to one of the supported filename
-        extensions ('.z', '.gz', '.bz2', '.xz' or '.lzma') will be used
-        automatically.
+    filename: str or pathlib.Path
+        The path of the file in which it is to be stored. The compression
+        method corresponding to one of the supported filename extensions ('.z',
+        '.gz', '.bz2', '.xz' or '.lzma') will be used automatically.
     compress: int from 0 to 9 or bool or 2-tuple, optional
         Optional compression level for the data. 0 or False is no compression.
         Higher value means more compression, but also slower read and
@@ -372,7 +393,7 @@ def dump(value, filename, compress=0, protocol=None, cache_size=None):
         between supported compressors (e.g 'zlib', 'gzip', 'bz2', 'lzma'
         'xz'), the second element must be an integer from 0 to 9, corresponding
         to the compression level.
-    protocol: int, optional
+    protocol: positive int
         Pickle protocol, see pickle.dump documentation for more details.
     cache_size: positive int, optional
         This option is deprecated in 0.10 and has no effect.
@@ -533,12 +554,12 @@ def load(filename, mmap_mode=None):
 
     Parameters
     -----------
-    filename: str, pathlib.Path, or file object.
-        The file object or path of the file from which to load the object
+    filename: str or pathlib.Path
+        The path of the file from which to load the object
     mmap_mode: {None, 'r+', 'r', 'w+', 'c'}, optional
         If not None, the arrays are memory-mapped from the disk. This
         mode has no effect for compressed files. Note that in this
-        case the reconstructed object might no longer match exactly
+        case the reconstructed object might not longer match exactly
         the originally pickled object.
 
     Returns
@@ -557,7 +578,7 @@ def load(filename, mmap_mode=None):
     dump. If the mmap_mode argument is given, it is passed to np.load and
     arrays are loaded as memmaps. As a consequence, the reconstructed
     object might not match the original pickled object. Note that if the
-    file was saved with compression, the arrays cannot be memmapped.
+    file was saved with compression, the arrays cannot be memmaped.
     """
     if Path is not None and isinstance(filename, Path):
         filename = str(filename)
